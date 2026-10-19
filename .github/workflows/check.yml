@@ -9,3 +9,11 @@ jobs:
       - uses: actions/checkout@v5
       - run: python3 -B -m unittest discover -s tests -v
       - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
+      - name: Build independent delivery tool bundle
+        run: python3 -B scripts/package.py --output dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deploy-delivery-server
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error

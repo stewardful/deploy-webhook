@@ -93,9 +93,7 @@ def main():
         Path(args.path).chmod(0o600)
     else:
         request = validate(json.loads(Path(args.path).read_text()))
-        result = {'request': request, 'ticket': {'url': authorize(request), 'revision': int(os.environ.get('URL_REVISION', '1'))}, 'files': {}}
-        for name in ('remote-install.py', 'delivery.py'):
-            result['files'][name] = (Path(__file__).parent/name).read_text()
+        result = {'protocol': 1, 'request': request, 'ticket': {'url': authorize(request), 'revision': int(os.environ.get('URL_REVISION', '1'))}}
         # Consumed only by SSH stdin, never console output or command arguments.
         json.dump(result, sys.stdout)
 

@@ -1,78 +1,110 @@
 #!/usr/bin/env python3
-"""Small root SSH control entry point. Accepts JSON on stdin; never receives archive bytes."""
-import fcntl
+"""Installed deploy-delivery command. JSON data only; no uploaded executable code."""
+import argparse
 import json
 import os
 from pathlib import Path
-import re
-import stat
+import platform
+import shutil
 import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-import tempfile
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from delivery import check_url, read_ticket, record, validate
+import service
 
-
-def write(path, value):
-    fd, temporary = tempfile.mkstemp(prefix='.control-', dir=path.parent)
-    try:
-        with os.fdopen(fd, 'w') as handle:
-            json.dump(value, handle); handle.flush(); os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally: Path(temporary).unlink(missing_ok=True)
+MAX_REQUEST = 24 * 1024
+SCRIPTS = Path(__file__).resolve().parent
 
 
 def control(payload, action):
-    request = payload['request']
-    if not re.fullmatch(r'[0-9]{1,20}', request['run_id']) or not re.fullmatch(r'[0-9]{1,6}', request['attempt']): raise ValueError()
-    stage = Path('/var/tmp')/('deploy-platform-ci-'+request['run_id']+'-'+request['attempt'])
-    lock = os.open('/run/lock/deploy-platform-ci-launch.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(lock, 'w') as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022: raise ValueError()
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    if set(payload) != {'protocol', 'request', 'ticket'} or payload['protocol'] != service.PROTOCOL:
+        raise ValueError('unsupported control envelope; executable files are forbidden')
+    request = validate(payload['request'])
+    policy = service.config()
+    if (request['repository'], request['arch']) != (policy['repository'], policy['arch']):
+        raise ValueError('request differs from server policy')
+    ticket = payload['ticket']
+    if set(ticket) != {'url', 'revision'} or type(ticket['revision']) is not int or not 1 <= ticket['revision'] <= 4:
+        raise ValueError('invalid ticket revision')
+    check_url(ticket['url'])
+    with service.locked(service.LAUNCH_LOCK):
+        stage = service.stage(request['run_id'], request['attempt'], exists=action != 'start')
         if action == 'start':
-            if stage.exists() or stage.is_symlink(): raise ValueError('delivery stage already exists; inspect its result before retrying')
+            if ticket['revision'] != 1: raise ValueError('initial revision must be one')
+            # mkdir fails on existing paths, including links: requests never replace a job.
             stage.mkdir(mode=0o700)
-            if set(payload['files']) != {'remote-install.py', 'delivery.py'}: raise ValueError()
-            for name, content in payload['files'].items():
-                if not isinstance(content, str) or len(content) > 128*1024: raise ValueError()
-                fd = os.open(stage/name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, 'w') as target: target.write(content)
-            sys.path.insert(0, str(stage))
-            from delivery import validate, check_url
-            validate(request); check_url(payload['ticket']['url'])
-            write(stage/'request.json', request)
-            write(stage/'download.json', payload['ticket'])
-            write(stage/'result.json', {'commit': request['commit'], 'phase': 'accepted'})
-            unit = 'deploy-platform-ci-'+request['run_id']+'-'+request['attempt']
-            result = subprocess.run(['systemd-run', '--no-block', '--unit='+unit, '--property=Type=oneshot', '--property=TimeoutStartSec=infinity', '--property=UMask=0077', '--property=Nice=10', '--property=MemoryHigh=256M', '/usr/bin/python3', str(stage/'remote-install.py'), request['commit']], capture_output=True)
+            record(stage/'request.json', request)
+            record(stage/'download.json', ticket)
+            record(stage/'result.json', {'commit': request['commit'], 'phase': 'accepted'})
+            unit = 'deploy-platform-ci-' + request['run_id'] + '-' + request['attempt']
+            result = subprocess.run(['systemd-run', '--no-block', '--unit='+unit,
+                                     '--property=Type=oneshot', '--property=TimeoutStartSec=infinity',
+                                     '--property=UMask=0077', '--property=Nice=10', '--property=MemoryHigh=256M',
+                                     '/usr/bin/python3', '-I', '-B', str(SCRIPTS/'remote-install.py'),
+                                     request['run_id'], request['attempt'], request['commit']], capture_output=True)
             if result.returncode:
-                write(stage/'result.json', {'commit': request['commit'], 'phase': 'failed', 'error_code': 'unit_start_failed'})
-                raise ValueError()
+                (stage/'download.json').unlink(missing_ok=True)
+                record(stage/'result.json', {'commit': request['commit'], 'phase': 'failed', 'error_code': 'unit_start_failed'})
+                raise ValueError('worker launch failed')
         elif action == 'refresh':
-            info = stage.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077: raise ValueError()
-            current = json.loads((stage/'request.json').read_text())
-            if current != request: raise ValueError()
-            phase = json.loads((stage/'result.json').read_text())['phase']
+            current = json.loads(service.trusted(stage/'request.json').read_text())
+            if current != request: raise ValueError('request changed')
+            phase = json.loads(service.trusted(stage/'result.json').read_text())['phase']
             if phase not in ('downloading', 'awaiting_url'): return
-            sys.path.insert(0, str(stage))
-            from delivery import check_url, read_ticket
-            check_url(payload['ticket']['url'])
             previous = read_ticket(stage)
-            if payload['ticket']['revision'] > previous['revision']:
-                write(stage/'download.json', payload['ticket'])
-        else: raise ValueError()
+            if ticket['revision'] > previous['revision']: record(stage/'download.json', ticket)
+        else: raise ValueError('unsupported action')
+
+
+def preflight(arch):
+    policy = service.config()
+    host_arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(platform.machine())
+    if arch != policy['arch'] or arch != host_arch: raise ValueError('server architecture differs')
+    subprocess.run(['/usr/bin/bash', '-c', 'source "$1"; check_supported_os', 'preflight', str(SCRIPTS/'os.sh')], check=True, capture_output=True)
+    if not Path('/sys/fs/cgroup/cgroup.controllers').is_file() or not Path('/run/systemd/system').is_dir():
+        raise ValueError('systemd and cgroup v2 required')
+    subprocess.run(['systemctl', 'show-environment'], check=True, capture_output=True)
+    if shutil.disk_usage('/opt').free < 2 * 1024**3: raise ValueError('2 GiB free disk required')
+    service.stage('1', '1', exists=False)
+    return dict(policy, version=service.VERSION, release=SCRIPTS.parent.name, phase='ready')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    sub.add_parser('version')
+    pre = sub.add_parser('preflight'); pre.add_argument('arch', choices=['amd64', 'arm64'])
+    for name in ('start', 'refresh'): sub.add_parser(name)
+    for name in ('status', 'logs'):
+        job = sub.add_parser(name); job.add_argument('run_id'); job.add_argument('attempt')
+    args = parser.parse_args()
+    if args.action == 'version':
+        print(json.dumps({'protocol': service.PROTOCOL, 'version': service.VERSION})); return
+    if os.geteuid() != 0: raise ValueError('root required')
+    os.umask(0o077)
+    service.config()
+    if args.action == 'preflight': print(json.dumps(preflight(args.arch)))
+    elif args.action in ('start', 'refresh'):
+        raw = sys.stdin.buffer.read(MAX_REQUEST+1)
+        if len(raw) > MAX_REQUEST: raise ValueError('control request too large')
+        control(json.loads(raw), args.action)
+        print('PASS: installed delivery tool accepted request')
+    else:
+        stage = service.stage(args.run_id, args.attempt)
+        path = service.trusted(stage/('result.json' if args.action == 'status' else 'install.log'))
+        if args.action == 'status':
+            value = json.loads(path.read_text())
+            # Never return stored download authorization or arbitrary JSON fields.
+            keys = {'commit', 'phase', 'error_code', 'downloaded_bytes', 'total_bytes', 'url_revision', 'version', 'artifact_id', 'message'}
+            print(json.dumps({k: v for k, v in value.items() if k in keys}))
+        else:
+            from collections import deque
+            with path.open() as handle: sys.stdout.write(''.join(deque(handle, maxlen=100)))
 
 
 if __name__ == '__main__':
-    os.umask(0o077)
-    try:
-        if os.geteuid() != 0 or sys.argv[1:] not in (['start'], ['refresh']): raise ValueError()
-        raw = sys.stdin.buffer.read(512*1024+1)
-        if len(raw) > 512*1024: raise ValueError()
-        control(json.loads(raw), sys.argv[1])
-        print('PASS: deployment control request accepted')
+    try: main()
     except Exception:
-        raise SystemExit('Deployment control failed; inspect the private stage and unit before retrying') from None
+        raise SystemExit('Delivery command failed; check installed tool, server policy and private job status/logs') from None

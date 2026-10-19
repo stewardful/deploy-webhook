@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Root systemd entry point for one CI delivery, independent of SSH and controld."""
-import fcntl
 import hashlib
 import json
 import os
@@ -10,9 +9,10 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-import stat
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from delivery import DeliveryError, record, validate
+import service
 
 
 def verify(stage):
@@ -51,7 +51,7 @@ def install(stage, commit):
                     # Enforce a wall-clock limit even during DNS/TLS/redirect stalls.
                     # Kill only the download child; never put a timeout around an active installer.
                     try:
-                        subprocess.run(['/usr/bin/python3', str(stage/'delivery.py'), str(stage)], check=True, timeout=request['download_seconds'], stdout=log, stderr=subprocess.STDOUT)
+                        subprocess.run(['/usr/bin/python3', str(Path(__file__).resolve().with_name('delivery.py')), str(stage)], check=True, timeout=request['download_seconds'], stdout=log, stderr=subprocess.STDOUT)
                     except subprocess.TimeoutExpired:
                         raise DeliveryError('download_timeout') from None
                     except subprocess.CalledProcessError:
@@ -83,30 +83,34 @@ def install(stage, commit):
         record(result, status)
 
 
-if __name__ == '__main__':
+def main():
     os.umask(0o077)
-    if os.geteuid() != 0 or len(sys.argv) != 2:
-        raise SystemExit('root and event commit required')
+    if os.geteuid() != 0 or len(sys.argv) != 4:
+        raise ValueError('root, run, attempt and commit required')
+    stage = service.stage(sys.argv[1], sys.argv[2])
+    commit = sys.argv[3]
     try:
-        # Serialize complete deliveries even if an earlier Actions runner disconnected.
-        descriptor = os.open('/run/lock/deploy-platform-ci.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, 'w') as lock:
-            info = os.fstat(lock.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022: raise ValueError('invalid lock')
-            try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                stage = Path(__file__).resolve().parent
-                (stage/'download.json').unlink(missing_ok=True)
-                record(stage/'result.json', {'commit': sys.argv[1], 'phase': 'failed', 'error_code': 'deployment_busy'})
-                raise
-            if not Path(__file__).with_name('request.json').is_file(): raise ValueError('download request required')
-            install(Path(__file__).resolve().parent, sys.argv[1])
-    except Exception:
-        stage = Path(__file__).resolve().parent
-        try:
-            state = json.loads((stage/'result.json').read_text())
-            if state.get('phase') != 'failed':
-                record(stage/'result.json', {'commit': sys.argv[1], 'phase': 'failed', 'error_code': 'worker_setup_failed'})
-        except (OSError, ValueError, IndexError): pass
+        request = validate(json.loads(service.trusted(stage/'request.json').read_text()))
+        policy = service.config()
+        if (request['run_id'], request['attempt'], request['commit']) != (sys.argv[1], sys.argv[2], commit) or (request['repository'], request['arch']) != (policy['repository'], policy['arch']):
+            raise ValueError('worker request differs from installed server policy')
+        # The previous adapter used this same lock, preventing mixed-version concurrency.
+        with service.locked(service.WORKER_LOCK, nonblocking=True):
+            install(stage, commit)
+    except BlockingIOError:
         (stage/'download.json').unlink(missing_ok=True)
-        raise SystemExit('CI deployment failed; inspect the private deployment log') from None
+        record(stage/'result.json', {'commit': commit, 'phase': 'failed', 'error_code': 'deployment_busy'})
+        raise
+    except Exception:
+        (stage/'download.json').unlink(missing_ok=True)
+        try:
+            if json.loads((stage/'result.json').read_text()).get('phase') != 'failed':
+                record(stage/'result.json', {'commit': commit, 'phase': 'failed', 'error_code': 'worker_setup_failed'})
+        except (OSError, ValueError): pass
+        raise
+
+
+if __name__ == '__main__':
+    try: main()
+    except Exception:
+        raise SystemExit('CI deployment failed; inspect deploy-delivery status/logs') from None

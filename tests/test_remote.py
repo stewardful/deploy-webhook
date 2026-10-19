@@ -57,7 +57,7 @@ class RemoteWrapperTests(unittest.TestCase):
 
 class SSHTransportTests(unittest.TestCase):
     def test_invalid_host_is_rejected_before_any_ssh_or_key_execution(self):
-        env=dict(os.environ,TEST_SSH_PRIVATE_KEY='test-only',TEST_SSH_KNOWN_HOSTS='test-only',TEST_SERVER_HOST='example.com;touch /tmp/unsafe',TEST_SERVER_USER='ubuntu',GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',GITHUB_SHA=SHA,RELEASE_VERSION='0.5.2')
+        env=dict(os.environ,GITHUB_REPOSITORY='owner/repo',TEST_SSH_PRIVATE_KEY='test-only',TEST_SSH_KNOWN_HOSTS='test-only',TEST_SERVER_HOST='example.com;touch /tmp/unsafe',TEST_SERVER_USER='ubuntu',GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',GITHUB_SHA=SHA,RELEASE_VERSION='0.5.2')
         result=subprocess.run(['bash',str(ROOT/'scripts/deploy-test.sh')],env=env,capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0)
         self.assertIn('invalid TEST_SERVER_HOST',result.stderr)
@@ -74,11 +74,11 @@ if os.path.basename(sys.argv[0])=='ssh':assert 'GH_TOKEN' not in os.environ
 with open(os.environ['CI_TEST_TRACE'],'a') as f:f.write(json.dumps([os.path.basename(sys.argv[0]),*sys.argv[1:]])+'\\n')
 if os.path.basename(sys.argv[0])=='scp':raise SystemExit('SCP must never be used')
 if os.path.basename(sys.argv[0])=='ssh':
-    if 'cat' in sys.argv:print('{"phase":"succeeded"}')
-    elif 'bash' in sys.argv:
-        script=sys.stdin.read()
-        open(os.environ['CI_TEST_TRACE']+'.preflight','w').write(script)
+    if 'status' in sys.argv:print('{"phase":"succeeded"}')
+    elif 'preflight' in sys.argv:
+        open(os.environ['CI_TEST_TRACE']+'.preflight','w').write(' '.join(sys.argv))
         if os.environ.get('CI_TEST_REJECT_HOST')=='1':sys.exit(42)
+        print(json.dumps({'protocol':1,'phase':'ready','arch':'amd64','repository':'owner/repo'}))
     else:
         payload=json.load(sys.stdin)
         assert payload['ticket']['url'].endswith('URL_SECRET_SENTINEL')
@@ -91,11 +91,11 @@ if os.path.basename(sys.argv[0])=='ssh':
 import json,os,sys
 if len(sys.argv)>1 and sys.argv[1].endswith('artifact-request.py'):
     if sys.argv[2]=='prepare':open(sys.argv[3],'w').write('{"commit":"a"}')
-    else:print(json.dumps({'request':{'commit':'a'},'ticket':{'url':'https://test.blob.core.windows.net/file?URL_SECRET_SENTINEL'},'files':{}}))
+    else:print(json.dumps({'request':{'commit':'a'},'ticket':{'url':'https://test.blob.core.windows.net/file?URL_SECRET_SENTINEL'},'protocol':1}))
 else:os.execv('''+repr(real_python)+''', ['''+repr(real_python)+''', *sys.argv[1:]])
 '''
             (bindir/'python3').write_text(wrapper);(bindir/'python3').chmod(0o755)
-            env=dict(os.environ,PATH=str(bindir)+os.pathsep+os.environ['PATH'],CI_TEST_TRACE=str(trace),CI_TEST_START=str(start),CI_ARTIFACT_DIR=str(root),TEST_SSH_PRIVATE_KEY='test-only',TEST_SSH_KNOWN_HOSTS='test-only',GH_TOKEN='test-only-gh',TEST_SERVER_HOST='127.0.0.1',TEST_SERVER_USER='ubuntu',TEST_SERVER_ARCH='amd64',GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',GITHUB_SHA=SHA,RELEASE_VERSION='0.5.3')
+            env=dict(os.environ,PATH=str(bindir)+os.pathsep+os.environ['PATH'],CI_TEST_TRACE=str(trace),CI_TEST_START=str(start),GITHUB_REPOSITORY='owner/repo',CI_ARTIFACT_DIR=str(root),TEST_SSH_PRIVATE_KEY='test-only',TEST_SSH_KNOWN_HOSTS='test-only',GH_TOKEN='test-only-gh',TEST_SERVER_HOST='127.0.0.1',TEST_SERVER_USER='ubuntu',TEST_SERVER_ARCH='amd64',GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',GITHUB_SHA=SHA,RELEASE_VERSION='0.5.3')
             result=subprocess.run(['bash',str(ROOT/'scripts/deploy-test.sh')],env=env,capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(json.loads(start.read_text())['request']['commit'],'a')
@@ -108,12 +108,16 @@ else:os.execv('''+repr(real_python)+''', ['''+repr(real_python)+''', *sys.argv[1
             self.assertNotIn('URL_SECRET_SENTINEL',trace.read_text()+result.stdout+result.stderr)
             self.assertNotIn('test-only',trace.read_text()+result.stdout+result.stderr)
             preflight=Path(str(trace)+'.preflight').read_text()
-            self.assertIn('check_supported_os',preflight)
-            self.assertIn('server architecture',preflight)
-            self.assertIn('cgroup.controllers',preflight)
+            self.assertIn('/usr/local/bin/deploy-delivery preflight amd64',preflight)
+            self.assertNotIn('python3 -c', trace.read_text())
+            self.assertNotIn('bash -s', trace.read_text())
+            for command in commands:
+                if command[0] == 'ssh': self.assertIn('/usr/local/bin/deploy-delivery', command)
+            self.assertEqual(set(json.loads(start.read_text())), {'protocol', 'request', 'ticket'})
             trace.unlink();start.unlink()
             rejected=subprocess.run(['bash',str(ROOT/'scripts/deploy-test.sh')],env=dict(env,CI_TEST_REJECT_HOST='1'),capture_output=True,text=True)
-            self.assertEqual(rejected.returncode,42,rejected.stderr)
+            self.assertEqual(rejected.returncode,1,rejected.stderr)
+            self.assertIn('Install/configure deploy-delivery', rejected.stderr)
             self.assertFalse(start.exists())
 
 
