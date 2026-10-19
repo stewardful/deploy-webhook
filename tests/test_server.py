@@ -136,3 +136,54 @@ class BundleTests(unittest.TestCase):
             result = subprocess.run([sys.executable, '-I', '-B', str(ROOT/'scripts/remote-control.py'), 'version'], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), {'protocol': 1, 'version': '0.1.0'})
+
+
+class WorkerBoundaryTests(unittest.TestCase):
+    def test_terminal_cleanup_is_serialized_with_refresh(self):
+        spec = importlib.util.spec_from_file_location('installed_worker', ROOT/'scripts/remote-install.py')
+        worker = importlib.util.module_from_spec(spec); spec.loader.exec_module(worker)
+        for busy in (False, True):
+            with self.subTest(busy=busy), tempfile.TemporaryDirectory() as directory:
+                stage = Path(directory)
+                (stage/'request.json').write_text(json.dumps(request()))
+                (stage/'download.json').write_text(json.dumps(envelope()['ticket']))
+                (stage/'result.json').write_text('{"phase":"accepted"}')
+                locks = []
+                def locked(path, **kwargs):
+                    locks.append(path)
+                    if busy and path == service.WORKER_LOCK: raise BlockingIOError()
+                    return nullcontext()
+                def installed(*args):
+                    (stage/'result.json').write_text('{"phase":"succeeded"}')
+                    # Represents a last credential refresh before final cleanup.
+                    (stage/'download.json').write_text('last refreshed ticket')
+                with patch.object(sys, 'argv', ['worker', '123', '1', 'a'*40]), patch.object(worker.os, 'geteuid', return_value=0), patch.object(service, 'stage', return_value=stage), patch.object(service, 'trusted', side_effect=lambda p, **kw: p), patch.object(service, 'config', return_value={'repository': 'owner/repo', 'arch': 'amd64'}), patch.object(service, 'locked', side_effect=locked), patch.object(worker, 'install', side_effect=installed):
+                    if busy:
+                        with self.assertRaises(BlockingIOError): worker.main()
+                    else: worker.main()
+                self.assertFalse((stage/'download.json').exists())
+                self.assertEqual(locks[-1], service.LAUNCH_LOCK)
+                self.assertEqual(json.loads((stage/'result.json').read_text())['phase'], 'failed' if busy else 'succeeded')
+
+    def test_server_path_policy_rejects_links_permissions_and_nonroot_owner(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import stat
+        path = Mock()
+        for mode, uid in [(stat.S_IFLNK | 0o777, 0), (stat.S_IFREG | 0o644, 0), (stat.S_IFREG | 0o600, 1000), (stat.S_IFREG | 0o620, 0)]:
+            path.lstat.return_value = SimpleNamespace(st_mode=mode, st_uid=uid)
+            with self.assertRaises(ValueError): service.trusted(path)
+        path.lstat.return_value = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0)
+        self.assertIs(service.trusted(path), path)
+
+    def test_real_authorization_envelope_contains_only_data(self):
+        import os
+        spec = importlib.util.spec_from_file_location('request_provider', ROOT/'scripts/artifact-request.py')
+        provider = importlib.util.module_from_spec(spec); spec.loader.exec_module(provider)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'request.json'; path.write_text(json.dumps(request()))
+            with patch.object(sys, 'argv', ['provider', 'authorize', str(path)]), patch.object(provider, 'authorize', return_value=envelope()['ticket']['url']), patch.dict(os.environ, URL_REVISION='1'), patch.object(sys, 'stdout', new_callable=io.StringIO) as output:
+                provider.main()
+                value = json.loads(output.getvalue())
+            self.assertEqual(set(value), {'protocol', 'request', 'ticket'})
+            self.assertEqual(value, envelope())
