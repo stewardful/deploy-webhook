@@ -103,11 +103,16 @@ def main():
         raise
     except Exception:
         (stage/'download.json').unlink(missing_ok=True)
-        try:
-            if json.loads((stage/'result.json').read_text()).get('phase') != 'failed':
-                record(stage/'result.json', {'commit': commit, 'phase': 'failed', 'error_code': 'worker_setup_failed'})
-        except (OSError, ValueError): pass
+        try: state = json.loads((stage/'result.json').read_text())
+        except (OSError, ValueError): state = {}
+        if state.get('phase') != 'failed':
+            record(stage/'result.json', {'commit': commit, 'phase': 'failed', 'error_code': 'worker_setup_failed'})
         raise
+    finally:
+        # Serialize terminal credential cleanup with refresh, so a late refresh cannot
+        # recreate authorization after the worker has finished.
+        with service.locked(service.LAUNCH_LOCK):
+            (stage/'download.json').unlink(missing_ok=True)
 
 
 if __name__ == '__main__':
