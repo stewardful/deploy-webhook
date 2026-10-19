@@ -20,7 +20,8 @@ PREFIX = Path('/opt/deploy-delivery')
 CONFIG = Path('/etc/deploy-delivery')
 STATE = Path('/var/lib/deploy-delivery')
 LAUNCHER = Path('/usr/local/bin/deploy-delivery')
-LAUNCHER_TEXT = '#!/bin/sh\nexec /usr/bin/python3 -I -B /opt/deploy-delivery/current/scripts/remote-control.py "$@"\n'
+LEGACY_LAUNCHER_TEXT = '#!/bin/sh\nexec /usr/bin/python3 -I -B /opt/deploy-delivery/current/scripts/remote-control.py "$@"\n'
+LAUNCHER_TEXT = '#!/bin/sh\nset -eu\nrelease=$(/usr/bin/readlink -f /opt/deploy-delivery/current)\nexec /usr/bin/python3 -I -B "$release/scripts/remote-control.py" "$@"\n'
 
 
 def inventory(source):
@@ -91,14 +92,14 @@ def install(source, repository, arch):
     directory(LAUNCHER.parent, 0o755)
     policy = {'protocol': 1, 'repository': repository, 'arch': arch}
     policy_path = CONFIG/'config.json'
-    if policy_path.exists() or policy_path.is_symlink():
-        safe(policy_path, private=True)
-        if json.loads(policy_path.read_text()) != policy: raise ValueError('existing server policy differs; do not silently rebind a server')
     # Coordinate activation with request acceptance, keeping all old releases for in-flight jobs.
     fd = os.open('/run/lock/deploy-platform-ci-launch.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as lock:
         safe(Path('/run/lock/deploy-platform-ci-launch.lock'), private=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if policy_path.exists() or policy_path.is_symlink():
+            safe(policy_path, private=True)
+            if json.loads(policy_path.read_text()) != policy: raise ValueError('existing server policy differs; do not silently rebind a server')
         files = {name: data['scripts/'+name] for name in SERVER_FILES}
         hashes = {name: hashlib.sha256(value).hexdigest() for name, value in files.items()}
         identity = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
@@ -133,7 +134,7 @@ def install(source, repository, arch):
             if current.resolve().parent != (PREFIX/'releases').resolve(): raise ValueError('current escapes release directory')
         if LAUNCHER.exists() or LAUNCHER.is_symlink():
             safe(LAUNCHER)
-            if LAUNCHER.read_text() != LAUNCHER_TEXT: raise ValueError('refusing to replace an unrelated command')
+            if LAUNCHER.read_text() not in (LAUNCHER_TEXT, LEGACY_LAUNCHER_TEXT): raise ValueError('refusing to replace an unrelated command')
         if not policy_path.exists(): replace(policy_path, (json.dumps(policy)+'\n').encode(), 0o600)
         try:
             activate(current, release)
