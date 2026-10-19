@@ -1,5 +1,8 @@
 name: Delivery components
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -8,4 +11,72 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: python3 -B -m unittest discover -s tests -v
+      - run: python3 -B -m unittest discover -s automation/tests -v
       - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
+  update-platform:
+    needs: test
+    if: github.repository == 'stewardful/deploy-delivery' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: update-platform-component
+      cancel-in-progress: false
+    steps:
+      - name: Check optional automation credentials
+        id: configuration
+        env:
+          APP_ID: ${{ vars.DELIVERY_APP_ID }}
+          APP_KEY: ${{ secrets.DELIVERY_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::warning::Component PR automation is not enabled: configure DELIVERY_APP_ID and DELIVERY_APP_PRIVATE_KEY.'
+            echo 'Component PR automation not enabled; see automation/README.md.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@v5
+        if: steps.configuration.outputs.enabled == 'true'
+        with:
+          path: delivery
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Skip superseded source commits
+        if: steps.configuration.outputs.enabled == 'true'
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_SHA: ${{ github.sha }}
+        run: |
+          current=$(gh api repos/stewardful/deploy-delivery/git/ref/heads/main --jq .object.sha)
+          if [ "$current" = "$TESTED_SHA" ]; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Skipped superseded source commit.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Mint scoped platform token
+        if: steps.latest.outputs.current == 'true'
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.DELIVERY_APP_ID }}
+          private-key: ${{ secrets.DELIVERY_APP_PRIVATE_KEY }}
+          owner: stewardful
+          repositories: deploy-platform
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: actions/checkout@v5
+        if: steps.latest.outputs.current == 'true'
+        with:
+          repository: stewardful/deploy-platform
+          ref: dev
+          path: platform
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+      - name: Open component update PR
+        if: steps.latest.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TESTED_SHA: ${{ github.sha }}
+        run: |
+          gh auth setup-git
+          python3 -B delivery/automation/update-platform.py --source delivery --target platform --revision "$TESTED_SHA"
