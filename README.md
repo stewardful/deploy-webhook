@@ -34,7 +34,3 @@ shellcheck scripts/*.sh
 Tests use temporary files and fake transports, without cloud credentials. Full disposable Ubuntu/systemd/container integration belongs to deploy-platform, which owns the installer.
 
 A private repository's workflow token cannot automatically read another private repository. deploy-platform therefore commits a reviewed source snapshot and a lock containing this repository's full commit SHA and file digests. Normal builds need no cross-repository token or runtime GitHub credentials. Update the snapshot explicitly using deploy-platform's vendor synchronization command; do not edit the snapshot directly.
-
-## Automatic component PRs
-
-After main CI passes, an optional scoped GitHub App opens a SHA-pinned component update PR against deploy-platform/dev. It never merges or deploys. See [configuration, permissions and verification](https://github.com/stewardful/deploy-delivery/blob/main/automation/README.md). Without the two App settings, CI explicitly reports automation as not enabled; ordinary component tests still run. Platform PR #4 must be merged before its dev branch can consume automated updates.
