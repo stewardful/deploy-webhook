@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+
+sys.dont_write_bytecode = True
 import urllib.error
 import urllib.request
 

@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+
+sys.dont_write_bytecode = True
 import stat
 
 from delivery import DeliveryError, record, validate

@@ -8,6 +8,8 @@ import re
 import stat
 import subprocess
 import sys
+
+sys.dont_write_bytecode = True
 import tempfile
 
 

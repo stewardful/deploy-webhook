@@ -2,6 +2,7 @@
 # GitHub runner transport only. Never embed Secrets in remote command strings.
 set -Eeuo pipefail
 umask 077
+export PYTHONDONTWRITEBYTECODE=1
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 : "${TEST_SSH_PRIVATE_KEY:?Set TEST_SSH_PRIVATE_KEY in GitHub Secrets}"
 : "${TEST_SSH_KNOWN_HOSTS:?Set verified TEST_SSH_KNOWN_HOSTS in GitHub Secrets}"

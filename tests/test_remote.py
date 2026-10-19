@@ -115,3 +115,18 @@ else:os.execv('''+repr(real_python)+''', ['''+repr(real_python)+''', *sys.argv[1
             rejected=subprocess.run(['bash',str(ROOT/'scripts/deploy-test.sh')],env=dict(env,CI_TEST_REJECT_HOST='1'),capture_output=True,text=True)
             self.assertEqual(rejected.returncode,42,rejected.stderr)
             self.assertFalse(start.exists())
+
+
+class SourceSnapshotTests(unittest.TestCase):
+    def test_entrypoints_do_not_modify_readonly_source_inventory(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(ROOT/'scripts', root/'scripts')
+            env = dict(os.environ); env.pop('PYTHONDONTWRITEBYTECODE', None)
+            result = subprocess.run([sys.executable, str(root/'scripts/artifact-request.py'), '--help'], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # No arguments: exits before opening any privileged host file.
+            result = subprocess.run([sys.executable, str(root/'scripts/remote-install.py')], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(list(root.rglob('*.pyc')))
