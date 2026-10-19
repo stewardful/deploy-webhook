@@ -34,3 +34,9 @@ shellcheck scripts/*.sh
 Tests use temporary files and fake transports, without cloud credentials. Full disposable Ubuntu/systemd/container integration belongs to deploy-platform, which owns the installer.
 
 A private repository's workflow token cannot automatically read another private repository. deploy-platform therefore commits a reviewed source snapshot and a lock containing this repository's full commit SHA and file digests. Normal builds need no cross-repository token or runtime GitHub credentials. Update the snapshot explicitly using deploy-platform's vendor synchronization command; do not edit the snapshot directly.
+
+## Repository and server boundary
+
+These repositories do not trigger each other's CI or create component update PRs. No GitHub App or cross-repository write token is required. deploy-platform builds its own artifacts and its dev workflow notifies the server over SSH; the server worker downloads the payload over HTTPS and invokes the protected platform installer. deploy-delivery maintains and tests the delivery tooling independently.
+
+Current implementation boundary: the platform still pins a reviewed adapter snapshot, and the runner sends small executor scripts to the server. This is not yet a separately preinstalled, independently updated server-side tool. Separating server-tool installation/versioning from platform CI is a future implementation step; it must retain artifact identity checks, short-lived download authorization and installer rollback protections. GitHub API tokens stay on the runner.
