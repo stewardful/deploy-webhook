@@ -2,7 +2,7 @@
 
 独立、可复用的 Go 服务：接收 GitHub Release Webhook，验签并持久化最新发布消息，再通过本机 HTTP/SSE 通知客户端。适用于现有 2 核 2 GiB Ubuntu 节点，不需要额外服务器、数据库、Redis、容器运行时或 root 常驻权限。
 
-本仓库已改为通知组件，删除旧 SSH 交付脚本、安装器和历史兼容入口。**服务不执行命令、不下载安装包、不持有 SSH 私钥，也不直接触发升级。** 更新包发现、完整性核验和受保护安装仍由 deploy-platform 的 cloudctl 负责；该平台目前尚未订阅本 API，接通消费者是后续独立改动。
+本仓库已改为通知组件，删除旧 SSH 交付脚本、安装器和历史兼容入口。**服务不执行命令、不下载安装包、不持有 SSH 私钥，也不直接触发升级。** 更新包发现、完整性核验和受保护安装仍由 deploy-platform 的 cloudctl 负责；平台 SSE 消费者见 [deploy-platform PR #5](https://github.com/stewardful/deploy-platform/pull/5)，两边合并部署后即可接入；通知服务本身仍不触发升级。
 
 ## 流程与最小配置
 
@@ -89,6 +89,12 @@ GitHub 源仓库添加 Webhook：
 事件只保留 repository、channel、tag、release_id、published_at，不采用请求里的脚本、URL、路径、命令或安装参数。签名证明来源，不证明代码安全；消费者仍须重新验证受信发布清单和包摘要，不能直接执行通知内容。
 
 请求正文最多 256 KiB、同时处理最多 8 个 Webhook，最多 16 个 SSE 订阅；慢消费者合并为最新快照，写入有期限。HTTP 头部/正文读取有超时；不记录原始正文、签名或密钥。持久化最多两个通道及 256 个有效投递 ID，状态文件最多 128 KiB，权限 0600，原子替换并 fsync，单进程锁阻止两实例写同一目录。状态格式错误明确失败，没有历史迁移。
+
+## 平台接入
+
+Go 控制端使用本机 `/v1/events`，不依赖本私有仓库的 SDK 或 GitHub 凭据。首次连接和重连发送完整快照，平台重新核对固定公开发布清单，不执行消息中的字段。平台 dev 自动开关默认关闭，开启命令为 `sudo cloudctl update policy --dev-auto-upgrade on`；正式版始终只提示手动确认。设置关闭用 `off`，不需要 GitHub Actions 开关或 SSH Secrets。
+
+API 和平台通过运行时 HTTP/SSE 契约协作，两个仓库 CI 独立，不互相触发。源码见关联 PR，尚未合并或部署；本通知服务的运行权限和原状态契约不因平台接入而扩大。
 
 ## 重启、遗漏与排错
 
