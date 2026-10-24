@@ -4,11 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStart=/usr/local/bin/release-notify --secret-file %d/webhook.secret
 DynamicUser=yes
-StateDirectory=deploy-delivery-notify
-StateDirectoryMode=0700
 LoadCredential=webhook.secret:/etc/deploy-delivery/webhook.secret
-ExecStart=/usr/local/bin/release-notify --secret-file %d/webhook.secret --state-dir /var/lib/deploy-delivery-notify
 Restart=on-failure
 RestartSec=5
 UMask=0077

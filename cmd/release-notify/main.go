@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -75,7 +76,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8090", "Loopback HTTP address; expose only the webhook through HTTPS reverse proxy")
 	repository := flag.String("repository", "stewardful/deploy-platform", "One allowed source repository")
 	secretFile := flag.String("secret-file", "", "Private webhook secret file; not the secret value")
-	stateDir := flag.String("state-dir", "./state", "Private persistent directory")
+	target := flag.String("target", "http://127.0.0.1:8088/hooks/github/releases", "Fixed loopback webhook target; never a command or script")
 	flag.Parse()
 	if flag.NArg() != 0 || !loopbackAddress(*listen) {
 		log.Fatal("no positional arguments; a literal loopback IP and nonzero port are required")
@@ -84,15 +85,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	store, err := notify.OpenStore(*stateDir)
-	if err != nil {
-		log.Fatal("cannot open notification state; check its permissions and format")
-	}
-	defer store.Close()
-	handler, err := notify.NewHandler(notify.Config{Repository: *repository, Secret: secret}, store)
+	forward, err := forwarder(*target)
 	if err != nil {
 		log.Fatal(err)
 	}
+	handler := notify.NewHandler(func() (notify.Config, error) { return notify.Config{Repository: *repository, Secret: secret}, nil }, forward)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	server := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
@@ -111,4 +108,31 @@ func main() {
 		log.Fatal("notification listener failed")
 	}
 	<-stopped
+}
+
+// The receiver validates first and forwards the original signed body to one fixed local API.
+func forwarder(target string) (func(*http.Request, []byte, notify.Notice) error, error) {
+	u, err := url.Parse(target)
+	if err != nil || u.Scheme != "http" || u.User != nil || !loopbackAddress(u.Host) || u.Path != "/hooks/github/releases" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, fmt.Errorf("target must be the fixed loopback webhook path")
+	}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil, ResponseHeaderTimeout: 3 * time.Second}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return func(original *http.Request, body []byte, _ notify.Notice) error {
+		req, err := http.NewRequestWithContext(original.Context(), "POST", target, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		for _, key := range []string{"Content-Type", "X-Hub-Signature-256", "X-GitHub-Event", "X-GitHub-Delivery"} {
+			req.Header.Set(key, original.Header.Get(key))
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("local task API unavailable")
+		}
+		defer response.Body.Close()
+		if response.StatusCode != 200 {
+			return fmt.Errorf("local task not accepted")
+		}
+		return nil
+	}, nil
 }

@@ -26,7 +26,7 @@ func validRepository(value string) bool {
 	return len(value) <= 200 && repositoryPattern.MatchString(value) && !strings.Contains(value, "..")
 }
 
-func (n Notice) valid() bool {
+func (n Notice) Valid() bool {
 	if !validRepository(n.Repository) || n.ReleaseID <= 0 || n.PublishedAt.IsZero() {
 		return false
 	}
@@ -40,24 +40,6 @@ func (n Notice) valid() bool {
 		return err == nil
 	case "stable":
 		return stableTag.MatchString(n.Tag)
-	}
-	return false
-}
-
-func newer(next, previous Notice) bool {
-	if next.Channel == "dev" {
-		n, _ := strconv.ParseUint(strings.TrimPrefix(next.Tag, "dev-"), 10, 64)
-		p, _ := strconv.ParseUint(strings.TrimPrefix(previous.Tag, "dev-"), 10, 64)
-		return n > p
-	}
-	n := strings.Split(strings.TrimPrefix(next.Tag, "v"), ".")
-	p := strings.Split(strings.TrimPrefix(previous.Tag, "v"), ".")
-	for i := range n {
-		nv, _ := strconv.ParseUint(n[i], 10, 64)
-		pv, _ := strconv.ParseUint(p[i], 10, 64)
-		if nv != pv {
-			return nv > pv
-		}
 	}
 	return false
 }
@@ -90,7 +72,7 @@ func (p releasePayload) notice(repository string) (Notice, bool, error) {
 	}
 	n := Notice{Repository: repository, Channel: channel, Tag: p.Release.Tag,
 		ReleaseID: p.Release.ID, PublishedAt: p.Release.PublishedAt.UTC()}
-	if !n.valid() {
+	if !n.Valid() {
 		return Notice{}, false, fmt.Errorf("unsupported release")
 	}
 	return n, true, nil

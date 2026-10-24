@@ -6,77 +6,44 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strings"
-	"time"
 )
 
 const maxBody = 256 * 1024
-const maxSubscribers = 16
 
-// Config pins the one permitted source repository. Secret is never returned by an API.
+var deliveryPattern = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
+
+// Config contains only local administrator policy and a fixed task submission boundary.
 type Config struct {
 	Repository string
 	Secret     []byte
 }
-
-// Handler exposes only release hints: no shell, runtime, download or upgrade operations.
 type Handler struct {
-	config Config
-	store  *Store
+	config func() (Config, error)
+	submit func(*http.Request, []byte, Notice) error
 	busy   chan struct{}
 }
 
-func NewHandler(config Config, store *Store) (*Handler, error) {
-	if !validRepository(config.Repository) || len(config.Secret) < 32 || len(config.Secret) > 1024 || store == nil {
-		return nil, fmt.Errorf("valid repository, 32-1024 byte secret and store required")
-	}
-	for _, previous := range store.Snapshot().Latest {
-		if previous.Repository != config.Repository {
-			return nil, fmt.Errorf("stored repository differs; use a separate state directory")
-		}
-	}
-	config.Secret = append([]byte(nil), config.Secret...)
-	return &Handler{config: config, store: store, busy: make(chan struct{}, 8)}, nil
+func NewHandler(config func() (Config, error), submit func(*http.Request, []byte, Notice) error) http.Handler {
+	return &Handler{config: config, submit: submit, busy: make(chan struct{}, 8)}
 }
-
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
-	switch r.URL.Path {
-	case "/hooks/github/releases":
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", "POST")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.webhook(w, r)
-	case "/healthz":
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, "{\"status\":\"ok\"}\n")
-	case "/v1/releases/latest":
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(h.store.Snapshot())
-	case "/v1/events":
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.events(w, r)
-	default:
+	if r.URL.Path != "/hooks/github/releases" {
 		http.NotFound(w, r)
+		return
 	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	h.webhook(w, r)
 }
 
 func signatureOK(secret []byte, signature string, body []byte) bool {
@@ -93,6 +60,11 @@ func signatureOK(secret []byte, signature string, body []byte) bool {
 }
 
 func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
+	cfg, err := h.config()
+	if err != nil || !validRepository(cfg.Repository) || len(cfg.Secret) < 32 || len(cfg.Secret) > 1024 {
+		http.Error(w, "webhook not configured", 503)
+		return
+	}
 	select {
 	case h.busy <- struct{}{}:
 		defer func() { <-h.busy }()
@@ -117,7 +89,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if !signatureOK(h.config.Secret, r.Header.Get("X-Hub-Signature-256"), body) {
+	if !signatureOK(cfg.Secret, r.Header.Get("X-Hub-Signature-256"), body) {
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
@@ -134,7 +106,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	notice, relevant, err := payload.notice(h.config.Repository)
+	notice, relevant, err := payload.notice(cfg.Repository)
 	if err != nil {
 		http.Error(w, "untrusted or unsupported release", http.StatusUnprocessableEntity)
 		return
@@ -143,7 +115,7 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	changed, err := h.store.Accept(r.Header.Get("X-GitHub-Delivery"), notice)
+	err = h.submit(r, body, notice)
 	if err != nil {
 		http.Error(w, "notification persistence failed", http.StatusServiceUnavailable)
 		return
@@ -151,54 +123,5 @@ func (h *Handler) webhook(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		Accepted bool `json:"accepted"`
-	}{Accepted: changed})
-}
-
-func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
-	changed, unsubscribe, ok := h.store.subscribe(maxSubscribers)
-	if !ok {
-		http.Error(w, "subscriber limit reached", http.StatusServiceUnavailable)
-		return
-	}
-	defer unsubscribe()
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("X-Accel-Buffering", "no")
-	controller := http.NewResponseController(w)
-	write := func(text string) error {
-		if err := controller.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil && !errors.Is(err, http.ErrNotSupported) {
-			return err
-		}
-		if _, err := io.WriteString(w, text); err != nil {
-			return err
-		}
-		return controller.Flush()
-	}
-	snapshot := func() error {
-		value := h.store.Snapshot()
-		data, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
-		return write(fmt.Sprintf("id: %d\nevent: snapshot\ndata: %s\n\n", value.Revision, data))
-	}
-	// Always send a complete snapshot, even with Last-Event-ID: no unbounded event history.
-	if err := snapshot(); err != nil {
-		return
-	}
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-changed:
-			if err := snapshot(); err != nil {
-				return
-			}
-		case <-ticker.C:
-			if err := write(": heartbeat\n\n"); err != nil {
-				return
-			}
-		}
-	}
+	}{Accepted: true})
 }
