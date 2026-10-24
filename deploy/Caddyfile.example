@@ -1,0 +1,14 @@
+# Replace this domain with one that resolves to this server.
+# Merge into your existing Caddy configuration; do not replace platform-managed files.
+notify.example.com {
+    @github {
+        path /hooks/github/releases
+        method POST
+    }
+    handle @github {
+        reverse_proxy 127.0.0.1:8090
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

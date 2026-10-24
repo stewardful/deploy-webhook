@@ -1,8 +1,10 @@
-__pycache__/
-*.pyc
-*.log
-.env
-*.pem
+/bin/
+/state/
+/coverage.out
 *.key
-
-dist/
+*.pem
+*.secret
+*.token
+.env
+.DS_Store
+/.cache/

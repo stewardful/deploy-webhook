@@ -1,97 +1,104 @@
-# deploy-delivery
+# deploy-delivery：最小发布通知 API
 
-独立安装在服务器上的交付工具：项目 CI 只通过 SSH 调用固定命令，服务器通过 HTTPS 拉取已构建的安装包。Python 3 标准库与 Bash 实现，无常驻守护进程、无平台轮询、无需 GitHub App、Docker Engine 或服务器编译环境。当前适配 deploy-platform 的 `.run --check` / `.run --upgrade` 安装协议。
+独立、可复用的 Go 服务：接收 GitHub Release Webhook，验签并持久化最新发布消息，再通过本机 HTTP/SSE 通知客户端。适用于现有 2 核 2 GiB Ubuntu 节点，不需要额外服务器、数据库、Redis、容器运行时或 root 常驻权限。
 
-## 两个仓库的职责
+本仓库已改为通知组件，删除旧 SSH 交付脚本、安装器和历史兼容入口。**服务不执行命令、不下载安装包、不持有 SSH 私钥，也不直接触发升级。** 更新包发现、完整性核验和受保护安装仍由 deploy-platform 的 cloudctl 负责；该平台目前尚未订阅本 API，接通消费者是后续独立改动。
 
-- deploy-delivery：独立测试、构建体积很小的服务器工具离线包，人工首次安装或更新工具。
-- deploy-platform：测试、构建平台更新包；dev CI 经 SSH 调用服务器已安装的工具，等待部署状态。两个仓库不互相触发、不自动创建 PR。
-- 服务器工具：绑定允许的项目仓库与架构，验证请求和下载内容，启动独立 systemd worker，调用平台安装器。平台安装器继续负责兼容性检查、任务排空、备份、迁移、业务验证和失败回退。交付成功只在安装器成功提交后报告。
+## 流程与最小配置
 
-## 首次安装（不由项目 CI 自动执行）
-
-先决条件：Ubuntu 24.04 / 26.04 LTS、amd64 / arm64、systemd、cgroup v2、Python 3、系统 CA 证书、运维账号可非交互 sudo。部署 preflight 要求 `/opt` 所在文件系统至少有 2 GiB 可用空间，这是磁盘空间，不是要求新增 2 GiB 内存。SSH 账号是有部署权限的运维账号；本工具不自动配置 sudoers。
-
-**本地电脑**：从辅助仓库某个成功的 main CI 下载 `deploy-delivery-server` 产物。将 RUN_ID 替换为 Actions 中成功运行的编号；本机 gh 需有读取该私有仓库的权限。
-
-```bash
-gh run download RUN_ID --repo stewardful/deploy-delivery --name deploy-delivery-server --dir ./delivery-package
+```text
+GitHub 发布固定 dev-RUN_ID 或 vX.Y.Z
+    → HTTPS /hooks/github/releases
+    → HMAC 验签、固定仓库、去重和版本排序
+    → 本地私有 state.json
+    → 本机查询或 SSE snapshot
+    → 消费者重新核对 GitHub 发布信息，按本机策略提示或升级
 ```
 
-也可以从同一个已确认提交在本地构建：
+默认源仓库 `stewardful/deploy-platform`，默认监听 `127.0.0.1:8090`。唯一必需凭据是一份 Webhook 随机密钥，分别保存在服务器私有文件与 GitHub **仓库 Settings → Webhooks → Secret** 中；无需 GitHub Actions 自定义 Secret、PAT、GitHub App 或服务器 SSH 凭据。域名和 DNS 是公开接入需要的部署配置。
+
+服务只支持字面量 loopback IP 监听，拒绝公网地址和主机名。Caddy 仅转发一个 POST 路径，查询和 SSE 留在本机。若放在另一台机器，消费者需要额外的安全网络/认证设计；当前版本面向同机集成，不提供公网订阅 API。
+
+## 构建与本地验证
+
+开发机需要 Go 1.25+；只用标准库，没有第三方 Go 依赖：
 
 ```bash
-python3 -B scripts/package.py --output dist
+make check test smoke
+./bin/release-notify --help
 ```
 
-产物为 `deploy-delivery-0.1.0.tar.gz` 和 `.tar.gz.sha256`，amd64/arm64 共用，不包含平台安装包或基础运行时。首次安装只需上传这两个小文件；不要上传服务器 SSH 私钥或 GitHub Token。以下示例在**本地电脑**执行，替换服务器地址与 SSH 端口：
+`make test` 开启 race detector；`make smoke` 以当前非 root 用户启动实际二进制，验证 HTTP、SSE、重启与持久化去重，不连接外部服务器。CI 使用最低 Go 1.25 和 stable，测试通过后构建 amd64/arm64 Linux 单文件程序和 SHA256，存放在对应 Actions 的 Artifacts，保留 14 天；CI 没有发布或服务器部署任务。私有仓库的 CI 产物下载需要登录 GitHub。
+
+在本地临时目录生成测试密钥并运行（不要提交或发送密钥）：
 
 ```bash
-ssh -p 22 lighthouse@SERVER 'install -d -m 700 ~/deploy-delivery-install'
-scp -P 22 ./delivery-package/deploy-delivery-0.1.0.tar.gz ./delivery-package/deploy-delivery-0.1.0.tar.gz.sha256 lighthouse@SERVER:deploy-delivery-install/
+mkdir -m 700 -p state
+(umask 077; openssl rand -hex 32 > state/webhook.secret)
+./bin/release-notify --secret-file ./state/webhook.secret --state-dir ./state
 ```
 
-**服务器**：校验同一可信 CI 运行下载的摘要，再解包安装。x86_64 使用 amd64，aarch64 使用 arm64。检查值用于完整性校验，首次包的来源仍需信任。
+另一个本地终端：
 
 ```bash
-cd ~/deploy-delivery-install
-sha256sum -c deploy-delivery-0.1.0.tar.gz.sha256
-tar -xzf deploy-delivery-0.1.0.tar.gz
-sudo /usr/bin/python3 -I -B deploy-delivery-0.1.0/scripts/install.py --repository stewardful/deploy-platform --arch amd64
-sudo /usr/local/bin/deploy-delivery version
-sudo /usr/local/bin/deploy-delivery preflight amd64
+curl --fail http://127.0.0.1:8090/healthz
+curl --fail http://127.0.0.1:8090/v1/releases/latest
+curl --no-buffer http://127.0.0.1:8090/v1/events
 ```
 
-成功信号：摘要检查 OK；安装器输出 PASS；version 为 `{"protocol": 1, "version": "0.1.0"}`；preflight 返回 `phase=ready`、预期 repository 和 arch。安装不部署任何平台或业务应用，不修改平台数据、containerd、Caddy 或应用卷。
+健康检查返回 `{"status":"ok"}`；初始快照 `revision=0`、`latest={}`。SSE 连接立即返回快照并保持连接，后续收到消息时推送新快照，每 15 秒发送心跳。断线后重新连接，总会收到最新完整快照，不依赖无限事件历史，也不使用定时查版本。
 
-## 项目 CI 接入
+## Ubuntu 部署步骤（手动执行，CI 不连接服务器）
 
-保留原有五个 SSH 配置和项目仓库自身的 `GITHUB_TOKEN`（contents/actions read）。运行 CI 端客户端：
+准备匹配架构的 `release-notify` 二进制和可信渠道取得的 SHA256，自行校验后安装到 `/usr/local/bin/release-notify`。目标服务器需要 systemd；反向代理可复用现有 Caddy，不要覆盖 deploy-platform 自动管理的配置。
 
 ```bash
-bash scripts/deploy-test.sh
+sudo install -m 0755 release-notify /usr/local/bin/release-notify
+sudo install -d -m 0700 /etc/deploy-delivery
+sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/deploy-delivery/webhook.secret'
+sudo install -m 0644 deploy/release-notify.service /etc/systemd/system/release-notify.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now release-notify
+curl --fail http://127.0.0.1:8090/healthz
 ```
 
-客户端固定调用 `/usr/local/bin/deploy-delivery`：
+生成密钥的命令只用于首次初始化，不要在重装时覆盖已有密钥。GitHub Webhook 设置时，在自己可信终端读取该文件，将值填入 Secret，不要放到仓库、命令行参数或日志。systemd 通过 LoadCredential 提供只读密钥副本；仅在管理器提供的凭据目录中接受这种 0440 文件，普通密钥仍要求 0600/0400。服务使用 DynamicUser 运行；状态目录由 systemd 创建，权限 0700。无 sudo、Docker Socket 或平台升级目录权限。示例限制 64 MiB 内存、25% 单核 CPU 和 16 个 SSE 订阅；这是隔离上限，不是已测量的实际占用。
 
-1. `preflight ARCH`：校验安装情况、协议、仓库策略、架构、系统和磁盘；失败时不签发下载 URL，也不会远程自动安装工具。
-2. `start`：仅从 stdin 接受 `{protocol, request, ticket}` JSON（上限 24 KiB）。不允许上传脚本、任意命令、工作目录或安装参数。启动任务后立即返回。
-3. `status RUN_ID ATTEMPT`：返回过滤后的 JSON 状态；`logs RUN_ID ATTEMPT`：返回私有安装日志最后 100 行。
-4. `refresh`：仅在下载等待授权时，使用原请求与递增 revision 刷新临时 URL；最多三次刷新，不改变产物身份。
+将 [Caddy 示例](deploy/Caddyfile.example) 中域名替换成你的通知域名，解析到现有服务器，并把路由合并到合适的代理配置。公网只需正常 HTTPS 443；8090 不对公网开放。DNS/ACME 与端口要求沿用你的 Caddy 部署方式。
 
-GitHub API Token 仅留在 runner。发送到服务器的只有固定身份元数据和短时 HTTPS 下载授权，不在命令参数或控制台输出授权。下载具有大小、时间、HTTPS 域名、摘要、封闭 ZIP 文件列表校验，支持 Range 续传。systemd worker 使用接受任务时的绝对版本路径，独立持锁，SSH 断开不取消下载和升级。runner 已断开且 URL 过期时无法刷新，会在期限内失败。
+GitHub 源仓库添加 Webhook：
 
-`protocol=1` 是客户端与服务器的兼容边界，工具无需每次随项目更新；不兼容或未安装时项目 CI 明确失败。平台可以保留经审查、按完整 SHA 固定的 CI 客户端/测试快照，但部署请求不会从快照向服务器发送执行代码，也不会更新工具自身。
+- Payload URL：`https://通知域名/hooks/github/releases`。
+- Content type：`application/json`。
+- Secret：与服务器文件内容相同的随机密钥。
+- Enable SSL verification，事件仅选择 **Releases**。
 
-## 目录、升级与排错
+签名正确的 ping 返回 204；符合条件的发布返回 `{"accepted":true}`，重复或旧发布返回 `{"accepted":false}`。GitHub 的 Recent Deliveries 可查看响应并手动 Redeliver。
 
-- `/usr/local/bin/deploy-delivery`：固定入口，使用隔离模式 Python，忽略调用者 PYTHONPATH。
-- `/opt/deploy-delivery/releases/版本-内容摘要/scripts/`：root 拥有的不可变服务端代码；`current` 原子切换版本。
-- `/etc/deploy-delivery/config.json`：root 私有，绑定 protocol、repository、arch。重复安装不得静默更换绑定。
-- `/var/lib/deploy-delivery/jobs/RUN_ID-ATTEMPT/`：root 私有请求、进度和诊断。临时下载授权在成功、失败、启动失败或并发拒绝后删除；进程被强制终止/服务器断电可能留下文件，需要运维检查。
-- `deploy-platform-ci-RUN_ID-ATTEMPT.service`：一次性任务；没有工具常驻服务。沿用全局 worker 锁，拒绝并行部署。
+## API 契约
 
-工具自身更新：取得新的可信工具包，执行同一套校验和安装命令。先验证候选模块、协议和完整性，成功后原子切换 `current`；候选失败保留旧入口。旧版本和任务目录保留，正在运行的任务继续使用旧版本代码；重装不会删除任务、改写项目配置或更新平台。目录只允许 root 修改，拒绝符号链接或不安全权限。
+| 端点 | 用途 | 对公网 |
+| --- | --- | --- |
+| `POST /hooks/github/releases` | GitHub 原始 JSON 与 HMAC-SHA256 签名 | 通过 HTTPS 代理 |
+| `GET /healthz` | 进程可用性 | 否 |
+| `GET /v1/releases/latest` | 当前 revision 和 dev/stable 最新消息 | 否 |
+| `GET /v1/events` | SSE，event 名 snapshot、id 为持久化 revision | 否 |
 
-查看一次任务（服务器执行）：
+只接受配置仓库的 `release/published`，并校验仓库 ID 非零、Release ID 与发布时间。预发布必须是 `dev-正整数`，正式版必须是 `vX.Y.Z`；忽略草稿、其他动作和滚动 `dev-latest`。dev 按构建编号、stable 按数值版本排序，重复签名正文即使换投递 ID 也不会重复推进版本；相同标签重建不会被当作新版本。
+
+事件只保留 repository、channel、tag、release_id、published_at，不采用请求里的脚本、URL、路径、命令或安装参数。签名证明来源，不证明代码安全；消费者仍须重新验证受信发布清单和包摘要，不能直接执行通知内容。
+
+请求正文最多 256 KiB、同时处理最多 8 个 Webhook，最多 16 个 SSE 订阅；慢消费者合并为最新快照，写入有期限。HTTP 头部/正文读取有超时；不记录原始正文、签名或密钥。持久化最多两个通道及 256 个有效投递 ID，状态文件最多 128 KiB，权限 0600，原子替换并 fsync，单进程锁阻止两实例写同一目录。状态格式错误明确失败，没有历史迁移。
+
+## 重启、遗漏与排错
+
+状态先落盘再唤醒消费者。重启后保留去重和最新消息；消费者 SSE 重连会拿到完整快照。**仅靠 Webhook 不能发现服务停机期间从未送达的版本**：GitHub 失败投递需要重投，平台消费者应在启动/重连或管理员检查时主动核对公开发布清单。该 API 不增加后台版本轮询。
 
 ```bash
-sudo /usr/local/bin/deploy-delivery status RUN_ID ATTEMPT
-sudo /usr/local/bin/deploy-delivery logs RUN_ID ATTEMPT
-sudo journalctl -u deploy-platform-ci-RUN_ID-ATTEMPT --no-pager
+sudo systemctl status release-notify
+sudo journalctl -u release-notify -n 100 --no-pager
 ```
 
-任务重试使用新的 ATTEMPT；同一编号不覆盖已有任务。服务器重启不是断线：瞬态 worker 不会在重启后自行重试，须先检查平台安装事务与任务结果，再发新请求。不要把失败误报为已回退成功，具体回退状态由平台安装器诊断确认。
+401：签名错误或密钥不一致；413：正文超限；422：仓库/标签/发布元数据不符合契约；503：并发、订阅数或状态写入异常。失败不会调用 cloudctl 或改变业务项目。
 
-工具不自动清理旧版本或失败产物。只在任务已终止、确认无需诊断/恢复后清理对应 job，清理旧工具版本前确认无运行任务引用它；不要删除活动目录或 `/var/lib/deploy-platform`、应用卷。私有日志可能包含业务运维信息，只提供给有部署权限的人员。
-
-## 测试
-
-```bash
-python3 -B -m unittest discover -s tests -v
-bash -n scripts/*.sh
-shellcheck scripts/*.sh
-python3 -B scripts/package.py --output dist
-```
-
-单元测试不需要云凭据；覆盖 JSON-only 协议、仓库/架构策略、旧请求拒绝、凭据清理、固定 worker 路径、包校验和 SSH 传输边界。完整隔离 Ubuntu/systemd/真实 SSH + TLS 验证由 deploy-platform 负责，包括独立安装、重复安装、坏候选保留旧工具、运行中更新工具、断线续跑、并发拒绝、损坏归档和 URL 过期续传。不会连接用户服务器。
+本版本未部署到用户服务器，也未配置真实 GitHub Webhook。测试使用本地签名事件和 HTTP/SSE，不能替代公网 HTTPS、真实 GitHub 投递及平台消费者联调。

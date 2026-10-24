@@ -1,19 +1,45 @@
-name: Delivery components
+name: Notification API
 on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  test:
+  check:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        go: ['1.25.x', stable]
     steps:
       - uses: actions/checkout@v5
-      - run: python3 -B -m unittest discover -s tests -v
-      - run: bash -n scripts/*.sh && shellcheck scripts/*.sh
-      - name: Build independent delivery tool bundle
-        run: python3 -B scripts/package.py --output dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/setup-go@v6
         with:
-          name: deploy-delivery-server
-          path: dist/*
+          go-version: ${{ matrix.go }}
+          cache: false
+      - run: make check test
+  build:
+    needs: check
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+      - name: Build small standalone Linux service
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: make build
+      - name: Exercise native binary without root privileges
+        if: matrix.arch == 'amd64'
+        run: python3 tests/smoke.py bin/release-notify
+      - name: Checksum artifact
+        run: cd bin && sha256sum release-notify > release-notify.sha256
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-notify-linux-${{ matrix.arch }}
+          path: bin/*
           retention-days: 14
           if-no-files-found: error
