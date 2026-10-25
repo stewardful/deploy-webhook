@@ -1,0 +1,24 @@
+[Unit]
+StartLimitIntervalSec=0
+Description=Fixed cloudctl dev install executor (no HTTP)
+After=deploy-webhook.service network-online.target
+Wants=network-online.target deploy-webhook.service
+
+[Service]
+Type=oneshot
+User=root
+StateDirectory=deploy-webhook-worker
+StateDirectoryMode=0700
+LoadCredential=webhook.secret:/etc/deploy-webhook/webhook.secret
+ExecStart=/usr/local/bin/deploy-webhook --worker --secret-file %d/webhook.secret
+TimeoutStartSec=infinity
+UMask=0077
+Nice=10
+CPUWeight=20
+MemoryHigh=64M
+Environment=GOMEMLIMIT=24MiB
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

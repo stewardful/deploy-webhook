@@ -1,9 +1,10 @@
-// release-notify is an unprivileged webhook receiver; it has no command runner.
+// deploy-webhook separates the unprivileged HTTP receiver from a fixed root executor.
 package main
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/stewardful/deploy-delivery/notify"
+	"github.com/stewardful/deploy-webhook/notify"
 )
 
 // systemd credentials are read-only 0440 files in a service-specific 0550
@@ -76,24 +76,49 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8090", "Loopback HTTP address; expose only the webhook through HTTPS reverse proxy")
 	repository := flag.String("repository", "stewardful/deploy-platform", "One allowed source repository")
 	secretFile := flag.String("secret-file", "", "Private webhook secret file; not the secret value")
-	target := flag.String("target", "http://127.0.0.1:8088/hooks/github/releases", "Fixed loopback webhook target; never a command or script")
+	stateDir := flag.String("state-dir", "/var/lib/deploy-webhook", "Private HTTP inbox directory")
+	ledgerDir := flag.String("ledger-dir", "/var/lib/deploy-webhook-worker", "Private root worker ledger")
+	worker := flag.Bool("worker", false, "Run the fixed cloudctl executor once; no HTTP listener")
+	status := flag.Bool("status", false, "Print the root execution ledger; no HTTP listener")
 	flag.Parse()
+	if *worker && *status {
+		log.Fatal("choose one mode")
+	}
 	if flag.NArg() != 0 || !loopbackAddress(*listen) {
 		log.Fatal("no positional arguments; a literal loopback IP and nonzero port are required")
+	}
+	if *status {
+		value, err := notify.ReadLedger(*ledgerDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(value); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 	secret, err := readSecret(*secretFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	forward, err := forwarder(*target)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *worker {
+		if os.Geteuid() != 0 {
+			log.Fatal("worker requires root")
+		}
+		if err := notify.Work(ctx, *stateDir, *ledgerDir, notify.Config{Repository: *repository, Secret: secret}, notify.ExecuteCloudctl); err != nil {
+			log.Fatal("cloudctl task failed; inspect deploy-webhook-worker journal and local ledger")
+		}
+		return
+	}
+	inbox, err := notify.OpenInbox(*stateDir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	handler := notify.NewHandler(func() (notify.Config, error) { return notify.Config{Repository: *repository, Secret: secret}, nil }, forward)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	handler := notify.NewHandler(func() (notify.Config, error) { return notify.Config{Repository: *repository, Secret: secret}, nil }, inbox.Accept)
 	server := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 8 * 1024,
+		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 8 * 1024,
 		BaseContext: func(net.Listener) context.Context { return ctx }}
 	stopped := make(chan struct{})
 	go func() {
@@ -108,31 +133,4 @@ func main() {
 		log.Fatal("notification listener failed")
 	}
 	<-stopped
-}
-
-// The receiver validates first and forwards the original signed body to one fixed local API.
-func forwarder(target string) (func(*http.Request, []byte, notify.Notice) error, error) {
-	u, err := url.Parse(target)
-	if err != nil || u.Scheme != "http" || u.User != nil || !loopbackAddress(u.Host) || u.Path != "/hooks/github/releases" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		return nil, fmt.Errorf("target must be the fixed loopback webhook path")
-	}
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil, ResponseHeaderTimeout: 3 * time.Second}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return func(original *http.Request, body []byte, _ notify.Notice) error {
-		req, err := http.NewRequestWithContext(original.Context(), "POST", target, bytes.NewReader(body))
-		if err != nil {
-			return err
-		}
-		for _, key := range []string{"Content-Type", "X-Hub-Signature-256", "X-GitHub-Event", "X-GitHub-Delivery"} {
-			req.Header.Set(key, original.Header.Get(key))
-		}
-		response, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("local task API unavailable")
-		}
-		defer response.Body.Close()
-		if response.StatusCode != 200 {
-			return fmt.Errorf("local task not accepted")
-		}
-		return nil
-	}, nil
 }

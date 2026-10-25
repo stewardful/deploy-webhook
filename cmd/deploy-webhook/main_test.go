@@ -1,11 +1,6 @@
 package main
 
 import (
-	"context"
-	"github.com/stewardful/deploy-delivery/notify"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,40 +72,5 @@ func TestReadOnlySystemdCredentialIsAcceptedOnlyAtManagerProvidedPath(t *testing
 		if _, err := readSecret(path); err == nil {
 			t.Fatal("insecure credential directory accepted")
 		}
-	}
-}
-
-func TestForwardingIsFixedAndPreservesSignedBody(t *testing.T) {
-	for _, target := range []string{"https://example.com/hooks/github/releases", "http://localhost:8088/hooks/github/releases", "http://127.0.0.1:8088/api/v1/apps", "http://127.0.0.1:8088/hooks/github/releases?command=sh"} {
-		if _, err := forwarder(target); err == nil {
-			t.Fatal("unsafe target", target)
-		}
-	}
-	calls := 0
-	code := 200
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		data, _ := io.ReadAll(r.Body)
-		if string(data) != "signed original" || r.Header.Get("X-Hub-Signature-256") != "signature" {
-			t.Error("body or signature changed")
-		}
-		w.WriteHeader(code)
-	}))
-	defer server.Close()
-	forward, err := forwarder(server.URL + "/hooks/github/releases")
-	if err != nil {
-		t.Fatal(err)
-	}
-	r, _ := http.NewRequestWithContext(context.Background(), "POST", "/hooks/github/releases", nil)
-	r.Header.Set("X-Hub-Signature-256", "signature")
-	if err := forward(r, []byte("signed original"), notify.Notice{}); err != nil {
-		t.Fatal(err)
-	}
-	code = 503
-	if err := forward(r, []byte("signed original"), notify.Notice{}); err == nil {
-		t.Fatal("acknowledged failed task")
-	}
-	if calls != 2 {
-		t.Fatal(calls)
 	}
 }
