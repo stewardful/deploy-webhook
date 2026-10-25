@@ -1,0 +1,11 @@
+[Unit]
+Description=Wake the fixed cloudctl executor after a durable Webhook
+After=deploy-webhook.service
+Wants=deploy-webhook.service
+
+[Path]
+PathChanged=/var/lib/deploy-webhook/inbox.json
+Unit=deploy-webhook-worker.service
+
+[Install]
+WantedBy=multi-user.target

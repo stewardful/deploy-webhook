@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+var commitPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
 var repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 var devTag = regexp.MustCompile(`^dev-([1-9][0-9]{0,19})$`)
 var stableTag = regexp.MustCompile(`^v(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$`)
@@ -20,6 +21,7 @@ type Notice struct {
 	Tag         string    `json:"tag"`
 	ReleaseID   int64     `json:"release_id"`
 	PublishedAt time.Time `json:"published_at"`
+	Commit      string    `json:"commit"`
 }
 
 func validRepository(value string) bool {
@@ -27,7 +29,7 @@ func validRepository(value string) bool {
 }
 
 func (n Notice) Valid() bool {
-	if !validRepository(n.Repository) || n.ReleaseID <= 0 || n.PublishedAt.IsZero() {
+	if !validRepository(n.Repository) || n.ReleaseID <= 0 || n.PublishedAt.IsZero() || !commitPattern.MatchString(n.Commit) {
 		return false
 	}
 	switch n.Channel {
@@ -53,6 +55,7 @@ type releasePayload struct {
 	Release struct {
 		ID          int64     `json:"id"`
 		Tag         string    `json:"tag_name"`
+		Commit      string    `json:"target_commitish"`
 		Draft       bool      `json:"draft"`
 		Prerelease  bool      `json:"prerelease"`
 		PublishedAt time.Time `json:"published_at"`
@@ -71,7 +74,7 @@ func (p releasePayload) notice(repository string) (Notice, bool, error) {
 		channel = "dev"
 	}
 	n := Notice{Repository: repository, Channel: channel, Tag: p.Release.Tag,
-		ReleaseID: p.Release.ID, PublishedAt: p.Release.PublishedAt.UTC()}
+		ReleaseID: p.Release.ID, PublishedAt: p.Release.PublishedAt.UTC(), Commit: p.Release.Commit}
 	if !n.Valid() {
 		return Notice{}, false, fmt.Errorf("unsupported release")
 	}

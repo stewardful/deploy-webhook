@@ -1,18 +1,19 @@
 [Unit]
-Description=GitHub release notification receiver (no command execution)
+Description=GitHub release Webhook inbox (unprivileged HTTP only)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/release-notify --secret-file %d/webhook.secret
 DynamicUser=yes
-LoadCredential=webhook.secret:/etc/deploy-delivery/webhook.secret
+StateDirectory=deploy-webhook
+StateDirectoryMode=0700
+LoadCredential=webhook.secret:/etc/deploy-webhook/webhook.secret
+ExecStart=/usr/local/bin/deploy-webhook --secret-file %d/webhook.secret
 Restart=on-failure
 RestartSec=5
 UMask=0077
 Environment=GOMEMLIMIT=24MiB
 Environment=GOMAXPROCS=2
-MemoryHigh=32M
 MemoryMax=64M
 TasksMax=32
 CPUQuota=25%
@@ -23,14 +24,10 @@ ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectKernelLogs=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-name: Notification API
+name: Webhook executor
 on: [push, pull_request]
 permissions:
   contents: read
@@ -34,12 +34,14 @@ jobs:
         run: make build
       - name: Exercise native binary without root privileges
         if: matrix.arch == 'amd64'
-        run: python3 tests/smoke.py bin/release-notify
+        run: python3 tests/smoke.py bin/deploy-webhook
       - name: Checksum artifact
-        run: cd bin && sha256sum release-notify > release-notify.sha256
+        run: cd bin && sha256sum deploy-webhook > deploy-webhook.sha256
       - uses: actions/upload-artifact@v6
         with:
-          name: release-notify-linux-${{ matrix.arch }}
-          path: bin/*
+          name: deploy-webhook-linux-${{ matrix.arch }}
+          path: |
+            bin/*
+            deploy/
           retention-days: 14
           if-no-files-found: error

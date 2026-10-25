@@ -12,7 +12,7 @@ import (
 )
 
 const testSecret = "01234567890123456789012345678901"
-const payload = `{"action":"published","repository":{"full_name":"stewardful/deploy-platform","id":1},"release":{"id":2,"tag_name":"dev-42","draft":false,"prerelease":true,"published_at":"2026-10-25T00:00:00Z","body":"ignored command and URL"}}`
+const payload = `{"action":"published","repository":{"full_name":"stewardful/deploy-platform","id":1},"release":{"id":2,"tag_name":"dev-42","target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","draft":false,"prerelease":true,"published_at":"2026-10-25T00:00:00Z","body":"ignored command and URL"}}`
 
 func hook(h http.Handler, body string, mutate func(*http.Request)) *httptest.ResponseRecorder {
 	r := httptest.NewRequest("POST", "/hooks/github/releases", strings.NewReader(body))

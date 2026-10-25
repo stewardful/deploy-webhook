@@ -34,6 +34,11 @@ func NewHandler(config func() (Config, error), submit func(*http.Request, []byte
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
+	if r.URL.Path == "/healthz" && r.Method == "GET" {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+		return
+	}
 	if r.URL.Path != "/hooks/github/releases" {
 		http.NotFound(w, r)
 		return
